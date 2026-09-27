@@ -112,6 +112,39 @@ export function renameProviderKey(
   );
 }
 
+/* -- Tenant-level connection management (no harness required) -- */
+
+export function disconnectConnection(provider: string, authType?: AuthType, label?: string) {
+  const params = new URLSearchParams();
+  if (authType) params.set('authType', authType);
+  if (label) params.set('label', label);
+  const qs = params.toString();
+  const base = `/providers/${encodeURIComponent(provider)}`;
+  return fetchMutate<{ ok: boolean; notifications: string[] }>(qs ? `${base}?${qs}` : base, {
+    method: 'DELETE',
+  });
+}
+
+export function renameConnection(
+  provider: string,
+  currentLabel: string,
+  newLabel: string,
+  authType?: AuthType,
+) {
+  return fetchMutate<{ id: string; label: string; priority: number }>(
+    `/providers/${encodeURIComponent(provider)}/keys/${encodeURIComponent(currentLabel)}`,
+    {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ newLabel, ...(authType && { authType }) }),
+    },
+  );
+}
+
+export function refreshConnectionModels() {
+  return fetchMutate<{ ok: boolean }>('/providers/refresh-models', { method: 'POST' });
+}
+
 export function reorderProviderKeys(
   agentName: string,
   provider: string,
@@ -439,6 +472,8 @@ export interface CustomProviderModel {
 export interface CustomProviderData {
   id: string;
   name: string;
+  /** Public prefix of the provider's model ids (`<alias>/<model>`); null = internal id. */
+  alias: string | null;
   base_url: string;
   api_kind: CustomProviderApiKind;
   has_api_key: boolean;
@@ -484,6 +519,7 @@ export function createCustomProvider(
   agentName: string,
   data: {
     name: string;
+    alias?: string | null;
     base_url: string;
     api_kind?: CustomProviderApiKind;
     apiKey?: string;
@@ -503,6 +539,7 @@ export function updateCustomProvider(
   id: string,
   data: {
     name?: string;
+    alias?: string | null;
     base_url?: string;
     api_kind?: CustomProviderApiKind;
     apiKey?: string;

@@ -9,13 +9,20 @@ import { supplementWithKnownModels } from './model-fallback';
 jest.mock('../common/utils/crypto.util', () => ({
   decrypt: jest.fn(),
   getEncryptionSecret: jest.fn(),
+  getDecryptionSecrets: jest.fn(() => ['test-secret-32-chars-long-enough!!']),
+  decryptWithAny: jest.fn((ciphertext: string, secrets: string[]) => {
+    const mod = jest.requireMock('../common/utils/crypto.util') as {
+      decrypt: (c: string, s: string) => string;
+    };
+    return { plaintext: mod.decrypt(ciphertext, secrets[0]), secretIndex: 0 };
+  }),
 }));
 
 jest.mock('../database/quality-score.util', () => ({
   computeQualityScore: jest.fn().mockReturnValue(3),
 }));
 
-import { decrypt, getEncryptionSecret } from '../common/utils/crypto.util';
+import { decrypt, getEncryptionSecret, getDecryptionSecrets } from '../common/utils/crypto.util';
 import { computeQualityScore } from '../database/quality-score.util';
 
 const mockDecrypt = decrypt as jest.MockedFunction<typeof decrypt>;
@@ -98,6 +105,7 @@ describe('ModelDiscoveryService', () => {
   };
   let mockModelsDevSync: {
     lookupModel: jest.Mock;
+    lookupModelCapabilities: jest.Mock;
     getModelsForProvider: jest.Mock;
     refreshCache: jest.Mock;
   };
@@ -112,8 +120,14 @@ describe('ModelDiscoveryService', () => {
       lookupPricing: jest.fn().mockReturnValue(null),
       getAll: jest.fn().mockReturnValue(new Map()),
     };
+    const lookupModel = jest.fn().mockReturnValue(null);
     mockModelsDevSync = {
-      lookupModel: jest.fn().mockReturnValue(null),
+      lookupModel,
+      // The real service tries the priced catalog first. Tests that exercise
+      // the capability-only catalog override this directly.
+      lookupModelCapabilities: jest.fn((providerId: string, modelId: string) =>
+        lookupModel(providerId, modelId),
+      ),
       getModelsForProvider: jest.fn().mockReturnValue([]),
       refreshCache: jest.fn().mockResolvedValue(0),
     };
@@ -171,13 +185,53 @@ describe('ModelDiscoveryService', () => {
       const provider = makeProvider();
       const result = await service.discoverModels(provider);
 
-      expect(mockGetSecret).toHaveBeenCalled();
+      expect(getDecryptionSecrets).toHaveBeenCalled();
       expect(mockDecrypt).toHaveBeenCalledWith('encrypted-key', expect.any(String));
       expect(fetcher.fetch).toHaveBeenCalledWith('openai', 'decrypted-key', 'api_key', undefined);
       expect(result).toHaveLength(1);
       expect(provider.cached_models).toEqual(result);
       expect(provider.models_fetched_at).toBeDefined();
       expect(providerRepo.save).toHaveBeenCalledWith(provider);
+    });
+
+    it('caches the current configured window after models.dev enrichment', async () => {
+      fetcher.fetch.mockResolvedValue([
+        makeModel({
+          id: 'gpt-5.6-sol',
+          contextWindow: 272000,
+          contextWindowSource: 'subscription_config',
+        }),
+      ]);
+      mockModelsDevSync.lookupModel.mockReturnValue({
+        name: 'GPT-5.6 Sol',
+        contextWindow: 400000,
+        inputPricePerToken: 0.000001,
+        outputPricePerToken: 0.000002,
+        reasoning: true,
+        toolCall: true,
+      });
+      mockComputeScore.mockImplementation(({ context_window }) =>
+        context_window >= 1000000 ? 5 : 4,
+      );
+      const provider = makeProvider({ auth_type: 'subscription' });
+
+      const result = await service.discoverModels(provider);
+      const sol = result.find((model) => model.id === 'gpt-5.6-sol');
+
+      expect(sol).toMatchObject({
+        contextWindow: 1050000,
+        contextWindowSource: 'subscription_config',
+        inputPricePerToken: 0.000001,
+        capabilityCode: true,
+        qualityScore: 5,
+      });
+      expect(mockComputeScore).toHaveBeenCalledWith(
+        expect.objectContaining({ context_window: 400000 }),
+      );
+      expect(mockComputeScore).toHaveBeenCalledWith(
+        expect.objectContaining({ context_window: 1050000 }),
+      );
+      expect(provider.cached_models).toEqual(result);
     });
 
     it('should return [] when decrypt fails', async () => {
@@ -246,6 +300,57 @@ describe('ModelDiscoveryService', () => {
 
       expect(result[0].inputModalities).toEqual(['text', 'image']);
       expect(result[0].outputModalities).toEqual(['text', 'image']);
+    });
+
+    it('should prefer provider-stated modalities over models.dev on both enrichment paths', async () => {
+      const mdEntry = {
+        id: 'x',
+        name: 'X',
+        toolCall: true,
+        inputPricePerToken: 0.000001,
+        outputPricePerToken: 0.000002,
+        inputModalities: ['text'],
+        outputModalities: ['text'],
+      };
+      mockModelsDevSync.lookupModel.mockReturnValue(mdEntry);
+      mockModelsDevSync.lookupModelCapabilities.mockReturnValue(mdEntry);
+      fetcher.fetch.mockResolvedValue([
+        // Already priced: capabilities come from applyCapabilities.
+        makeModel({
+          id: 'priced-vision',
+          inputPricePerToken: 0,
+          outputPricePerToken: 0,
+          inputModalities: ['text', 'image'],
+        }),
+        // Unpriced: models.dev prices it and supplies capabilities.
+        makeModel({ id: 'unpriced-vision', inputModalities: ['text', 'image'] }),
+        // The provider says audio out only, so it is not a chat model.
+        makeModel({ id: 'speech-only', outputModalities: ['audio'] }),
+      ]);
+
+      const result = await service.discoverModels(makeProvider());
+
+      expect(result.map((m) => [m.id, m.inputModalities, m.outputModalities])).toEqual([
+        ['priced-vision', ['text', 'image'], ['text']],
+        ['unpriced-vision', ['text', 'image'], ['text']],
+      ]);
+    });
+
+    it('should prefer models.dev modalities over the curated known-modalities list', async () => {
+      mockModelsDevSync.lookupModelCapabilities.mockReturnValue({
+        id: 'gpt-5.3-codex-spark',
+        name: 'Spark',
+        toolCall: true,
+        inputModalities: ['text', 'image'],
+        outputModalities: ['text'],
+      });
+      fetcher.fetch.mockResolvedValue([
+        makeModel({ id: 'gpt-5.3-codex-spark', inputPricePerToken: 0, outputPricePerToken: 0 }),
+      ]);
+
+      const result = await service.discoverModels(makeProvider());
+
+      expect(result[0].inputModalities).toEqual(['text', 'image']);
     });
 
     it('should enrich models with openRouter pricing when available', async () => {
@@ -602,19 +707,36 @@ describe('ModelDiscoveryService', () => {
       });
     });
 
-    it('refuses custom providers and reports the cached count', async () => {
+    it('refuses custom providers and reports the models entered by hand', async () => {
+      // The connection row's discovery cache stays empty for custom providers;
+      // reporting it read as a wiped catalog (#2962).
       providerRepo.find.mockResolvedValue([
         makeProvider({
           provider: 'custom:cp-1',
-          cached_models: [makeModel({ id: 'foo' }), makeModel({ id: 'bar' })],
+          cached_models: null,
           models_fetched_at: '2026-04-12T08:00:00.000Z',
         }),
       ]);
-      const result = await service.refreshProvider('agent-1', 'custom:cp-1');
+      customProviderRepo.findOne.mockResolvedValue({
+        id: 'cp-1',
+        models: [{ model_name: 'foo' }, { model_name: 'bar' }],
+      });
+      const result = await service.refreshProvider('tenant-1', 'custom:cp-1');
+      expect(customProviderRepo.findOne).toHaveBeenCalledWith({
+        where: { id: 'cp-1', tenant_id: 'tenant-1' },
+      });
       expect(result.ok).toBe(false);
       expect(result.model_count).toBe(2);
       expect(result.last_fetched_at).toBe('2026-04-12T08:00:00.000Z');
       expect(result.error).toContain('Custom providers are managed manually');
+    });
+
+    it('reports zero models when the custom provider row is gone', async () => {
+      providerRepo.find.mockResolvedValue([makeProvider({ provider: 'custom:cp-1' })]);
+      customProviderRepo.findOne.mockResolvedValue(null);
+      const result = await service.refreshProvider('tenant-1', 'custom:cp-1');
+      expect(result.model_count).toBe(0);
+      expect(result.last_fetched_at).toBeNull();
     });
 
     it('returns ok with the discovered count on success', async () => {
@@ -786,6 +908,18 @@ describe('ModelDiscoveryService', () => {
       expect(result[1].id).toBe('custom:cp-1/custom-llm');
       expect(result[1].provider).toBe('custom:cp-1');
       expect(result[1].displayName).toBe('custom-llm');
+      expect(result[1].providerName).toBe('My Custom');
+      expect(result[1]).not.toHaveProperty('providerAlias');
+    });
+
+    it('carries the custom provider alias so /v1/models can publish it', async () => {
+      providerRepo.find.mockResolvedValue([]);
+      customProviderRepo.find.mockResolvedValue([makeCustomProvider({ alias: 'my-custom' })]);
+
+      const result = await service.getModelsForAgent('agent-1');
+
+      expect(result[0].providerAlias).toBe('my-custom');
+      expect(result[0].providerName).toBe('My Custom');
     });
 
     it('should filter stale unsupported OpenAI subscription cached models', async () => {
@@ -807,6 +941,37 @@ describe('ModelDiscoveryService', () => {
       const result = await service.getModelsForAgent('agent-1');
 
       expect(result.map((m) => m.id)).toEqual(['gpt-5.5', 'gpt-5.3-codex-spark']);
+    });
+
+    it('updates only explicitly configured subscription context windows', async () => {
+      providerRepo.find.mockResolvedValue([
+        makeProvider({
+          provider: 'openai',
+          auth_type: 'subscription',
+          cached_models: [
+            makeModel({
+              id: 'gpt-5.6-sol',
+              contextWindow: 272000,
+              contextWindowSource: 'subscription_config',
+            }),
+            makeModel({
+              id: 'gpt-5.6-terra',
+              contextWindow: 272000,
+              contextWindowSource: 'provider',
+            }),
+            makeModel({ id: 'gpt-5.6-luna', contextWindow: 272000 }),
+          ],
+        }),
+      ]);
+      customProviderRepo.find.mockResolvedValue([]);
+
+      const result = await service.getModelsForAgent('tenant-1');
+
+      expect(result.map((model) => [model.id, model.contextWindow])).toEqual([
+        ['gpt-5.6-sol', 1050000],
+        ['gpt-5.6-terra', 272000],
+        ['gpt-5.6-luna', 272000],
+      ]);
     });
 
     it('should keep Mistral Vibe subscription cached models that API-key Mistral hides', async () => {
@@ -1037,6 +1202,19 @@ describe('ModelDiscoveryService', () => {
       expect(providerRepo.find).toHaveBeenCalledTimes(2);
     });
 
+    it('invalidateTenant drops every agent of that tenant and no other', async () => {
+      await service.getModelsForAgent('tenant-1', 'agent-1');
+      await service.getModelsForAgent('tenant-1', 'agent-2');
+      await service.getModelsForAgent('tenant-2', 'agent-3');
+      service.invalidateTenant('tenant-1');
+
+      await service.getModelsForAgent('tenant-1', 'agent-1'); // refetch
+      await service.getModelsForAgent('tenant-1', 'agent-2'); // refetch
+      await service.getModelsForAgent('tenant-2', 'agent-3'); // still cached
+
+      expect(providerRepo.find).toHaveBeenCalledTimes(5);
+    });
+
     it('only invalidates the targeted agent', async () => {
       await service.getModelsForAgent('tenant-1', 'agent-1');
       await service.getModelsForAgent('tenant-1', 'agent-2');
@@ -1196,6 +1374,197 @@ describe('ModelDiscoveryService', () => {
       // Capabilities applied from models.dev
       expect(result[0].capabilityReasoning).toBe(true);
       expect(result[0].capabilityCode).toBe(true);
+    });
+
+    it('should apply capabilities from an unmapped models.dev provider (priced model)', async () => {
+      // Kilo prices its own catalog, so enrichment takes the price-already-set
+      // path. models.dev does not map `kilo`, so only the custom-provider
+      // catalog carries its modalities.
+      mockModelsDevSync.lookupModelCapabilities.mockImplementation(
+        (providerId: string, modelId: string) =>
+          providerId === 'kilo' && modelId === 'openai/gpt-4o-mini'
+            ? {
+                id: 'openai/gpt-4o-mini',
+                name: 'GPT-4o mini',
+                inputPricePerToken: 0.00000015,
+                outputPricePerToken: 0.0000006,
+                reasoning: true,
+                toolCall: true,
+                inputModalities: ['text', 'image'],
+                outputModalities: ['text'],
+                capabilities: ['text', 'image', 'tools'],
+              }
+            : null,
+      );
+
+      fetcher.fetch.mockResolvedValue([
+        makeModel({
+          id: 'openai/gpt-4o-mini',
+          provider: 'kilo',
+          inputPricePerToken: 0.0000002,
+          outputPricePerToken: 0.0000008,
+        }),
+      ]);
+
+      const result = await service.discoverModels(makeProvider({ provider: 'kilo' }));
+
+      expect(result[0].inputModalities).toEqual(['text', 'image']);
+      expect(result[0].outputModalities).toEqual(['text']);
+      expect(result[0].capabilityReasoning).toBe(true);
+      // The connection's own price wins; models.dev pricing is never read here.
+      expect(result[0].inputPricePerToken).toBe(0.0000002);
+      expect(result[0].outputPricePerToken).toBe(0.0000008);
+    });
+
+    it('should apply capabilities from an unmapped models.dev provider (unpriced model)', async () => {
+      // Xiaomi's /models publishes no pricing, so enrichment falls through
+      // every pricing source before capabilities are applied.
+      mockModelsDevSync.lookupModelCapabilities.mockImplementation(
+        (providerId: string, modelId: string) =>
+          providerId === 'xiaomi' && modelId === 'mimo-v2.5'
+            ? {
+                id: 'mimo-v2.5',
+                name: 'MiMo V2.5',
+                inputPricePerToken: 0.0000004,
+                outputPricePerToken: 0.0000016,
+                reasoning: true,
+                toolCall: true,
+                inputModalities: ['text', 'image'],
+                outputModalities: ['text'],
+                capabilities: ['text', 'image', 'tools'],
+              }
+            : null,
+      );
+
+      fetcher.fetch.mockResolvedValue([makeModel({ id: 'mimo-v2.5', provider: 'xiaomi' })]);
+
+      const result = await service.discoverModels(makeProvider({ provider: 'xiaomi' }));
+
+      expect(result[0].inputModalities).toEqual(['text', 'image']);
+      expect(result[0].capabilityReasoning).toBe(true);
+      // No pricing source resolved, so the model stays unpriced rather than
+      // borrowing the aggregator's rate.
+      expect(result[0].inputPricePerToken).toBeNull();
+      expect(result[0].outputPricePerToken).toBeNull();
+    });
+
+    it('should keep tool-less chat models without advertising tools', async () => {
+      // Regression for #2963: Groq's allam-2-7b is a text chat model that
+      // models.dev marks toolCall=false. It must stay in the catalog, flagged
+      // as unable to call tools, rather than silently disappear.
+      const entries: Record<string, unknown> = {
+        'allam-2-7b': {
+          id: 'allam-2-7b',
+          name: 'ALLaM 2 7B',
+          toolCall: false,
+          capabilities: ['text'],
+        },
+        'openai/gpt-oss-20b': {
+          id: 'openai/gpt-oss-20b',
+          name: 'GPT OSS 20B',
+          toolCall: true,
+          capabilities: ['text', 'tools'],
+        },
+      };
+      mockModelsDevSync.lookupModelCapabilities.mockImplementation(
+        (providerId: string, modelId: string) =>
+          providerId === 'groq' ? (entries[modelId] ?? null) : null,
+      );
+
+      fetcher.fetch.mockResolvedValue([
+        makeModel({ id: 'allam-2-7b', provider: 'groq' }),
+        makeModel({ id: 'openai/gpt-oss-20b', provider: 'groq' }),
+      ]);
+
+      const result = await service.discoverModels(makeProvider({ provider: 'groq' }));
+
+      // Both stay; enrichment tells them apart on tool support.
+      expect(
+        result.map((m) => [m.id, m.capabilityCode, m.capabilities?.includes('tools')]),
+      ).toEqual([
+        ['allam-2-7b', false, false],
+        ['openai/gpt-oss-20b', true, true],
+      ]);
+    });
+
+    it('should drop models whose resolved modalities carry no text', async () => {
+      // Video generators and speech recognisers cannot answer a chat request,
+      // whether models.dev or the provider's own /models response says so. A
+      // model no source describes is kept.
+      const entries: Record<string, unknown> = {
+        'veo-3.1-generate-preview': {
+          id: 'veo-3.1-generate-preview',
+          name: 'Veo',
+          toolCall: false,
+          inputModalities: ['text', 'image'],
+          outputModalities: ['video'],
+        },
+        'qwen3-asr-flash': {
+          id: 'qwen3-asr-flash',
+          name: 'ASR',
+          toolCall: false,
+          inputModalities: ['audio'],
+          outputModalities: ['text'],
+        },
+        'chat-model': {
+          id: 'chat-model',
+          name: 'Chat',
+          toolCall: true,
+          inputModalities: ['text'],
+          outputModalities: ['text'],
+        },
+        'partial-entry': { id: 'partial-entry', name: 'Partial', toolCall: false },
+      };
+      mockModelsDevSync.lookupModelCapabilities.mockImplementation(
+        (_providerId: string, modelId: string) => entries[modelId] ?? null,
+      );
+
+      fetcher.fetch.mockResolvedValue([
+        makeModel({ id: 'veo-3.1-generate-preview' }),
+        makeModel({ id: 'qwen3-asr-flash' }),
+        makeModel({ id: 'chat-model' }),
+        makeModel({ id: 'partial-entry' }),
+        makeModel({ id: 'unknown-model' }),
+        makeModel({ id: 'native-video', inputModalities: ['text'], outputModalities: ['video'] }),
+      ]);
+
+      const result = await service.discoverModels(makeProvider());
+
+      expect(result.map((m) => m.id)).toEqual(['chat-model', 'partial-entry', 'unknown-model']);
+    });
+
+    it('should route capability lookups through lookupModelCapabilities', async () => {
+      // enrichModel must not read capabilities from lookupModel: that path is
+      // reserved for pricing, and a capability-only entry carries a reseller's
+      // rate for a vendor's model ID. Only the capability catalog answers here,
+      // so reverting enrichModel to lookupModel leaves the flags unset.
+      mockModelsDevSync.lookupModel.mockReturnValue(null);
+      mockModelsDevSync.lookupModelCapabilities.mockImplementation(
+        (providerId: string, modelId: string) =>
+          providerId === 'openai' && modelId === 'test-model'
+            ? {
+                id: 'test-model',
+                name: 'Test Model',
+                reasoning: true,
+                toolCall: true,
+                inputModalities: ['text', 'image'],
+                outputModalities: ['text'],
+                capabilities: ['text', 'image', 'tools'],
+              }
+            : null,
+      );
+      fetcher.fetch.mockResolvedValue([
+        makeModel({ inputPricePerToken: 0, outputPricePerToken: 0 }),
+      ]);
+
+      const result = await service.discoverModels(makeProvider());
+
+      expect(mockModelsDevSync.lookupModelCapabilities).toHaveBeenCalledWith(
+        'openai',
+        'test-model',
+      );
+      expect(result[0].capabilityReasoning).toBe(true);
+      expect(result[0].inputModalities).toEqual(['text', 'image']);
     });
 
     it('should fall back to exact model ID lookup when prefix lookup misses', async () => {
@@ -1642,9 +2011,11 @@ describe('ModelDiscoveryService', () => {
       // environments (pricing-cache state moves ids around).
       expect(result.map((m) => m.id).sort()).toEqual([
         'claude-fable-5',
+        'claude-fable-5-1',
         'claude-haiku-4',
         'claude-opus-4',
         'claude-opus-5',
+        'claude-opus-5-5',
         'claude-sonnet-4',
         'claude-sonnet-5',
       ]);
@@ -1766,6 +2137,27 @@ describe('ModelDiscoveryService', () => {
         'sk-cp-global-token',
         'subscription',
         undefined,
+      );
+    });
+
+    it('routes MiniMax CN API-key discovery to the CN OpenAI endpoint', async () => {
+      mockDecrypt.mockReturnValue('sk-minimax-api-key');
+      fetcher.fetch.mockResolvedValue([]);
+
+      await service.discoverModels(
+        makeProvider({
+          provider: 'minimax',
+          auth_type: 'api_key',
+          api_key_encrypted: 'encrypted',
+          region: 'cn',
+        }),
+      );
+
+      expect(fetcher.fetch).toHaveBeenCalledWith(
+        'minimax',
+        'sk-minimax-api-key',
+        'api_key',
+        'https://api.minimaxi.com/v1',
       );
     });
 
@@ -2008,12 +2400,14 @@ describe('ModelDiscoveryService', () => {
       );
 
       // Subscription membership comes only from the curated knownModels list.
-      expect(result).toHaveLength(6);
+      expect(result).toHaveLength(8);
       expect(result.map((m) => m.id).sort()).toEqual([
         'claude-fable-5',
+        'claude-fable-5-1',
         'claude-haiku-4',
         'claude-opus-4',
         'claude-opus-5',
+        'claude-opus-5-5',
         'claude-sonnet-4',
         'claude-sonnet-5',
       ]);
@@ -2209,12 +2603,14 @@ describe('ModelDiscoveryService', () => {
       );
 
       // Even without pricingSync, knownModels are returned directly
-      expect(result).toHaveLength(6);
+      expect(result).toHaveLength(8);
       expect(result.map((m) => m.id).sort()).toEqual([
         'claude-fable-5',
+        'claude-fable-5-1',
         'claude-haiku-4',
         'claude-opus-4',
         'claude-opus-5',
+        'claude-opus-5-5',
         'claude-sonnet-4',
         'claude-sonnet-5',
       ]);
@@ -2298,6 +2694,7 @@ describe('ModelDiscoveryService', () => {
       expect(ids).toContain('gemini-2.5-pro');
       expect(ids).toContain('gemini-2.5-flash');
       expect(ids).toContain('gemini-3.1-flash-lite');
+      expect(ids).toContain('gemini-3.5-flash');
       // Suffixed preview NOT included (exact match mode)
       expect(ids).not.toContain('gemini-2.5-pro-preview-06-05');
       // Non-gemini models excluded
@@ -2361,7 +2758,8 @@ describe('ModelDiscoveryService', () => {
       expect(ids).toContain('gemini-2.5-pro');
       expect(ids).toContain('gemini-2.5-flash-lite');
       expect(ids).toContain('gemini-3.1-flash-lite');
-      expect(ids).toContain('gemini-3.1-flash-lite-preview');
+      expect(ids).toContain('gemini-3.5-flash');
+      expect(ids).not.toContain('gemini-3.1-flash-lite-preview');
       expect(ids).not.toContain('gemini-3.1-pro-preview');
       expect(ids).not.toContain('gemini-3-flash-preview');
       expect(fetcher.fetch).not.toHaveBeenCalled();

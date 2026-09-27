@@ -244,6 +244,37 @@ describe('TierService', () => {
       }
     });
 
+    it('routes a custom model named bare next to its provider (issue #2962)', async () => {
+      const custom = 'custom:6f1c2b9e-0000-4000-8000-000000000001';
+      discoveryService.getModelsForAgent.mockResolvedValue([
+        discovered('llama-3.3-70b', 'groq', 'api_key'),
+        discovered(`${custom}/deepseek-v4-pro`, custom, 'api_key'),
+      ]);
+      tierRepo.findOne.mockResolvedValue(null);
+
+      const result = await svc.setOverride(
+        'agent-1',
+        'tenant-1',
+        'default',
+        'deepseek-v4-pro',
+        custom,
+        'api_key',
+      );
+
+      expect(result.override_route).toEqual(route(custom, 'api_key', `${custom}/deepseek-v4-pro`));
+    });
+
+    it("lists the named provider's models when its model is unknown", async () => {
+      discoveryService.getModelsForAgent.mockResolvedValue([
+        discovered('llama-3.3-70b', 'groq', 'api_key'),
+        discovered('deepseek/deepseek-chat-v3.1:free', 'openrouter', 'api_key'),
+      ]);
+
+      await expect(
+        svc.setOverride('agent-1', 'tenant-1', 'default', 'deepseek-v9', 'openrouter'),
+      ).rejects.toThrow('choose from: openrouter/deepseek/deepseek-chat-v3.1:free');
+    });
+
     it('throws when the provider does not offer the model', async () => {
       discoveryService.getModelsForAgent.mockResolvedValue([
         discovered('gpt-4o', 'openai', 'api_key'),
@@ -490,6 +521,23 @@ describe('TierService', () => {
       expect(result).toEqual([route('openai', 'api_key', 'gpt-4o')]);
     });
 
+    it('resolves a fallback given by its public /v1/models id', async () => {
+      discoveryService.getModelsForAgent.mockResolvedValue([
+        discovered('deepseek/deepseek-chat-v3.1:free', 'openrouter', 'api_key'),
+      ]);
+      tierRepo.findOne.mockResolvedValue({
+        agent_id: 'agent-1',
+        tier: 'default',
+        fallback_routes: null,
+      } as TierAssignment);
+
+      const result = await svc.setFallbacks('agent-1', 'tenant-1', 'default', [
+        'openrouter/deepseek/deepseek-chat-v3.1:free',
+      ]);
+
+      expect(result).toEqual([route('openrouter', 'api_key', 'deepseek/deepseek-chat-v3.1:free')]);
+    });
+
     it('falls back to discovery when caller routes do not exist in available list', async () => {
       discoveryService.getModelsForAgent.mockResolvedValue([
         discovered('gpt-4o', 'openai', 'api_key'),
@@ -666,7 +714,7 @@ describe('TierService', () => {
     it('rejects clearing the only stream-capable route while stream mode is active', async () => {
       tierRepo.findOne.mockResolvedValue({
         tier: 'standard',
-        override_route: route('custom:local', 'api_key', 'local-model'),
+        override_route: route('openai', 'api_key', 'gpt-image-1'),
         auto_assigned_route: null,
         fallback_routes: [route('openai', 'api_key', 'gpt-4o')],
         response_mode: 'stream',
@@ -683,7 +731,7 @@ describe('TierService', () => {
     it('rejects stream mode when the route chain has no stream-capable model', async () => {
       tierRepo.findOne.mockResolvedValue({
         tier: 'standard',
-        override_route: route('custom:local', 'api_key', 'local-model'),
+        override_route: route('openai', 'api_key', 'gpt-image-1'),
         auto_assigned_route: null,
         fallback_routes: null,
       } as TierAssignment);
@@ -699,7 +747,7 @@ describe('TierService', () => {
         tier: 'standard',
         override_route: route('openai', 'api_key', 'gpt-4o'),
         auto_assigned_route: null,
-        fallback_routes: [route('custom:local', 'api_key', 'local-model')],
+        fallback_routes: [route('openai', 'api_key', 'gpt-image-1')],
       } as TierAssignment;
       tierRepo.findOne.mockResolvedValue(existing);
 
@@ -734,18 +782,18 @@ describe('TierService', () => {
       } as TierAssignment;
       tierRepo.findOne.mockResolvedValue(existing);
       discoveryService.getModelsForAgent.mockResolvedValue([
-        discovered('local-model', 'custom:local', 'api_key'),
+        discovered('gpt-image-1', 'openai', 'api_key'),
       ]);
 
       const result = await svc.setFallbacks(
         'agent-1',
         'tenant-1',
         'standard',
-        ['local-model'],
-        [route('custom:local', 'api_key', 'local-model')],
+        ['gpt-image-1'],
+        [route('openai', 'api_key', 'gpt-image-1')],
       );
 
-      expect(result).toEqual([route('custom:local', 'api_key', 'local-model')]);
+      expect(result).toEqual([route('openai', 'api_key', 'gpt-image-1')]);
       expect(tierRepo.save).toHaveBeenCalledWith(existing);
     });
   });

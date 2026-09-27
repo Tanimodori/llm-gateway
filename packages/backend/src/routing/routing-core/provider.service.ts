@@ -17,7 +17,12 @@ import { AgentMessage } from '../../entities/agent-message.entity';
 import { ModelPricingCacheService } from '../../model-prices/model-pricing-cache.service';
 import { RoutingCacheService } from './routing-cache.service';
 import { randomUUID } from 'crypto';
-import { encrypt, decrypt, getEncryptionSecret } from '../../common/utils/crypto.util';
+import {
+  encrypt,
+  decryptWithAny,
+  getEncryptionSecret,
+  getDecryptionSecrets,
+} from '../../common/utils/crypto.util';
 import {
   isManifestUsableProvider,
   isSupportedSubscriptionProvider,
@@ -40,6 +45,10 @@ import {
   getSubscriptionEndpointRegionConfig,
   SubscriptionEndpointRegionConfig,
 } from '../subscription-region';
+import {
+  MINIMAX_API_KEY_REGION_VALIDATION_MESSAGE,
+  isMinimaxRegion,
+} from '../oauth/minimax/minimax-oauth-helpers';
 import { filterProvidersForDeployment } from '../../common/utils/provider-availability';
 import { getManagedFreeProviderConfig } from '../../common/constants/managed-free-providers';
 
@@ -248,7 +257,7 @@ export class ProviderService {
     const row = rows.find((r) => r.label.toLowerCase() === wantedLabel);
     if (!row?.api_key_encrypted) return null;
     try {
-      return decrypt(row.api_key_encrypted, getEncryptionSecret());
+      return decryptWithAny(row.api_key_encrypted, getDecryptionSecrets()).plaintext;
     } catch {
       return null;
     }
@@ -306,7 +315,7 @@ export class ProviderService {
         readFreshRaw: async () => {
           if (!row?.api_key_encrypted) return null;
           try {
-            return decrypt(row.api_key_encrypted, getEncryptionSecret());
+            return decryptWithAny(row.api_key_encrypted, getDecryptionSecrets()).plaintext;
           } catch {
             return null;
           }
@@ -540,7 +549,7 @@ export class ProviderService {
   }
 
   async renameKey(
-    agentId: string,
+    agentId: string | null,
     tenantId: string,
     provider: string,
     authType: AuthType,
@@ -564,7 +573,7 @@ export class ProviderService {
     target.updated_at = new Date().toISOString();
     await this.providerRepo.save(target);
     await this.relabelOverrides(tenantId, provider, authType, previousLabel, trimmed);
-    this.routingCache.invalidateAgent(agentId);
+    if (agentId !== null) this.routingCache.invalidateAgent(agentId);
     this.routingCache.invalidateTenant(tenantId);
     return target;
   }
@@ -622,6 +631,16 @@ export class ProviderService {
     existing: TenantProvider | null,
   ): Promise<string | null> {
     const lower = provider.toLowerCase();
+
+    if (lower === 'minimax' && authType === 'api_key') {
+      if (requestedRegion === undefined) {
+        return isMinimaxRegion(existing?.region ?? undefined) ? existing!.region : null;
+      }
+      if (!isMinimaxRegion(requestedRegion)) {
+        throw new BadRequestException(MINIMAX_API_KEY_REGION_VALIDATION_MESSAGE);
+      }
+      return requestedRegion;
+    }
 
     const subscriptionRegionConfig = getSubscriptionEndpointRegionConfig(lower, authType);
     if (subscriptionRegionConfig) {
@@ -696,7 +715,7 @@ export class ProviderService {
     if (!existing?.api_key_encrypted) return null;
 
     try {
-      return decrypt(existing.api_key_encrypted, getEncryptionSecret());
+      return decryptWithAny(existing.api_key_encrypted, getDecryptionSecrets()).plaintext;
     } catch {
       this.logger.warn('Failed to decrypt API key while auto-detecting Alibaba region');
       return null;
@@ -1371,7 +1390,7 @@ export class ProviderService {
 
   private decryptOrNull(encrypted: string): string | null {
     try {
-      return decrypt(encrypted, getEncryptionSecret());
+      return decryptWithAny(encrypted, getDecryptionSecrets()).plaintext;
     } catch {
       return null;
     }

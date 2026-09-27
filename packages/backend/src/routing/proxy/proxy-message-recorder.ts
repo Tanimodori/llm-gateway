@@ -1,4 +1,4 @@
-import { Injectable, Logger, OnModuleDestroy } from '@nestjs/common';
+import { Injectable, Logger, OnModuleDestroy, Optional } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { v4 as uuid } from 'uuid';
@@ -13,7 +13,10 @@ import {
 } from 'manifest-shared';
 import { AgentMessage } from '../../entities/agent-message.entity';
 import { ManifestRequest } from '../../entities/request.entity';
-import { ModelPricingCacheService } from '../../model-prices/model-pricing-cache.service';
+import {
+  ModelPricingCacheService,
+  type PricingEntry,
+} from '../../model-prices/model-pricing-cache.service';
 import { IngestEventBusService } from '../../common/services/ingest-event-bus.service';
 import { IngestionContext } from '../../otlp/interfaces/ingestion-context.interface';
 import { FailedFallback } from './proxy-fallback.service';
@@ -25,6 +28,8 @@ import type { ProviderAttemptRef, ProviderAttemptStart, ProxyApiMode } from './p
 import { CustomProviderService } from '../custom-provider/custom-provider.service';
 import { OpencodeGoCatalogService } from '../../model-discovery/opencode-go-catalog.service';
 import { PROVIDER_BY_ID_OR_ALIAS } from '../../common/constants/providers';
+import { isLocalOnlyProvider } from '../../common/utils/provider-availability';
+import { ProviderService } from '../routing-core/provider.service';
 import { extractManifestErrorCode, type ManifestErrorCode } from '../../common/errors/error-codes';
 import {
   MANIFEST_CODE_TO_REASON,
@@ -181,6 +186,21 @@ export interface ManifestBlockedRequestOpts {
    * still names its surface.
    */
   apiMode?: ProxyApiMode;
+  /**
+   * How the request was classified, when Manifest failed after routing ran (a
+   * post-routing M500). Keeps tier and header-tier filters matching the row.
+   * Provider stays null (the row still claims no provider attempt); the
+   * requested model is still recorded in the model field.
+   */
+  routing?: ManifestBlockedRouting;
+}
+
+export interface ManifestBlockedRouting {
+  tier?: string;
+  specificityCategory?: string;
+  headerTierId?: string;
+  headerTierName?: string;
+  headerTierColor?: string;
 }
 
 export interface PendingRequestOpts {
@@ -240,6 +260,12 @@ export interface FallbackSuccessOpts extends HeaderTierRef {
   requestParams?: RequestParamDefaults | null;
   /** Request-level Autofix outcome when a failed retry later fell back. */
   autofix?: AutofixRecord;
+  /**
+   * Autofix audit of the winning fallback hop itself. Only this record stamps
+   * the fallback-success row's linkage columns, so an ordinary fallback success
+   * never inherits the primary's Autofix retry metadata.
+   */
+  fallbackAutofix?: AutofixRecord;
   /** API surface to retain when this terminal write creates the Request. */
   apiMode?: ProxyApiMode;
 }
@@ -434,6 +460,8 @@ export class ProxyMessageRecorder implements OnModuleDestroy {
     private readonly eventBus: IngestEventBusService,
     private readonly customProviders: CustomProviderService,
     private readonly opencodeGoCatalog: OpencodeGoCatalogService,
+    @Optional()
+    private readonly providerService?: ProviderService,
   ) {
     this.cooldownCleanupTimer = setInterval(() => this.evictExpiredCooldowns(), 60_000);
     if (typeof this.cooldownCleanupTimer === 'object' && 'unref' in this.cooldownCleanupTimer) {
@@ -443,6 +471,106 @@ export class ProxyMessageRecorder implements OnModuleDestroy {
 
   onModuleDestroy(): void {
     clearInterval(this.cooldownCleanupTimer);
+  }
+
+  private isCopilotSubscription(provider?: string, authType?: string): boolean {
+    if (authType !== 'subscription' || !provider) return false;
+    return PROVIDER_BY_ID_OR_ALIAS.get(provider.toLowerCase())?.id === 'copilot';
+  }
+
+  private async copilotTokenPricing(
+    ctx: IngestionContext,
+    tenantProviderId: string | null | undefined,
+    model: string,
+    promptTokens: number,
+  ): Promise<PricingEntry | undefined> {
+    if (!tenantProviderId || !this.providerService) return undefined;
+
+    let providers;
+    try {
+      providers = await this.providerService.getProviders(ctx.tenantId);
+    } catch {
+      return undefined;
+    }
+
+    const connection = providers.find((candidate) => candidate.id === tenantProviderId);
+    const bareModel = model.toLowerCase().replace(/^copilot\//, '');
+    const cached = Array.isArray(connection?.cached_models)
+      ? connection.cached_models.find(
+          (candidate) => candidate.id.toLowerCase().replace(/^copilot\//, '') === bareModel,
+        )
+      : undefined;
+    const validPrice = (price: number | null): price is number =>
+      typeof price === 'number' && Number.isFinite(price) && price >= 0;
+    if (
+      !cached ||
+      !validPrice(cached.inputPricePerToken) ||
+      !validPrice(cached.outputPricePerToken)
+    ) {
+      return undefined;
+    }
+
+    const longContext = cached.longContextPricing;
+    const useLongContext =
+      longContext != null &&
+      Number.isSafeInteger(longContext.thresholdTokens) &&
+      longContext.thresholdTokens > 0 &&
+      promptTokens > longContext.thresholdTokens &&
+      validPrice(longContext.inputPricePerToken) &&
+      validPrice(longContext.outputPricePerToken) &&
+      (longContext.inputPricePerToken > 0 || longContext.outputPricePerToken > 0);
+    const effective = useLongContext ? longContext : cached;
+    if (effective.inputPricePerToken === 0 && effective.outputPricePerToken === 0) {
+      return undefined;
+    }
+
+    return {
+      model_name: cached.id,
+      provider: connection?.provider ?? 'copilot',
+      input_price_per_token: effective.inputPricePerToken,
+      output_price_per_token: effective.outputPricePerToken,
+      cache_read_price_per_token: effective.cacheReadPricePerToken,
+      cache_write_price_per_token: effective.cacheWritePricePerToken,
+      display_name: cached.displayName || null,
+    };
+  }
+
+  private async computeCost(
+    ctx: IngestionContext,
+    model: string,
+    provider: string | undefined,
+    authType: string | undefined,
+    usage: StreamUsage | undefined,
+    tenantProviderId?: string | null,
+    canonicalProvider?: string | null,
+    at?: Date,
+  ): Promise<number | null> {
+    const isCopilot = this.isCopilotSubscription(provider, authType);
+    const copilotPricing =
+      isCopilot && usage
+        ? await this.copilotTokenPricing(ctx, tenantProviderId, model, usage.prompt_tokens)
+        : undefined;
+
+    return computeTokenCost({
+      inputTokens: usage?.prompt_tokens ?? 0,
+      outputTokens: usage?.completion_tokens ?? 0,
+      cacheReadTokens: usage?.cache_read_tokens ?? 0,
+      cacheCreationTokens: usage?.cache_creation_tokens ?? 0,
+      model,
+      // Priced on the raw keys: a custom provider's rates are stored under
+      // `custom:<uuid>/<model>`, which is exactly what canonicalization strips.
+      pricing:
+        copilotPricing ??
+        (!isCopilot && usage ? this.pricingCache.getByModel(model, provider) : undefined),
+      isSubscription: authType === 'subscription' && !copilotPricing,
+      isLocalProvider: isLocalOnlyProvider(canonicalProvider ?? provider ?? ''),
+      perRequestCostUsd: copilotPricing
+        ? null
+        : await this.perRequestSubscriptionCost(provider, authType, model),
+      // Copilot's usage.cost is a premium-request multiplier, not USD.
+      reportedCostUsd: isCopilot ? undefined : usage?.reported_cost_usd,
+      at,
+    });
   }
 
   /**
@@ -608,6 +736,34 @@ export class ProxyMessageRecorder implements OnModuleDestroy {
     this.eventBus.emit(ctx.tenantId, 'message', ctx.userId);
   }
 
+  /**
+   * Cancel Provider Attempts the caller disconnected under. A disconnect in the
+   * middle of the fallback chain throws out of the chain before its local
+   * failure list reaches a terminal writer, so these rows would otherwise stay
+   * `pending` forever. Only rows still pending are touched: a terminal write
+   * that already landed keeps its real outcome. Updates run in parallel and a
+   * failed one never stops the rest.
+   */
+  async cancelPendingProviderAttempts(attempts: ProviderAttemptRef[]): Promise<void> {
+    await Promise.all(
+      attempts.map(async (attempt) => {
+        if (!(await attempt.pendingWrite.catch(() => false))) return;
+        await this.messageRepo
+          .update(
+            { id: attempt.id, status: PENDING_STATUS },
+            {
+              status: CANCELLED_STATUS,
+              error_message: null,
+              error_code: null,
+              error_http_status: null,
+              duration_ms: Math.max(0, (attempt.completedAtMs ?? Date.now()) - attempt.startedAtMs),
+            },
+          )
+          .catch((e) => this.logger.warn(`Failed to cancel Provider Attempt ${attempt.id}: ${e}`));
+      }),
+    );
+  }
+
   /** Complete an intermediate provider call that is retried below the proxy layer. */
   async completePendingProviderFailure(
     attempt: ProviderAttemptRef,
@@ -753,6 +909,7 @@ export class ProxyMessageRecorder implements OnModuleDestroy {
       durationMs,
       attempt,
       apiMode,
+      routing,
     } = opts;
 
     const canonical = await this.customProviders.canonicalizeAgentMessageKeys(
@@ -774,20 +931,20 @@ export class ProxyMessageRecorder implements OnModuleDestroy {
       error_http_status: httpStatus ?? null,
       model: canonical.model,
       provider: null,
-      routing_tier: null,
+      routing_tier: routing?.tier ?? null,
       routing_reason: reason,
       fallback_from_model: null,
       fallback_index: null,
       auth_type: null,
-      specificity_category: null,
+      specificity_category: routing?.specificityCategory ?? null,
       provider_key_label: null,
       tenant_provider_id: null,
       caller_attribution: callerAttribution ?? null,
       request_headers: requestHeaders ?? null,
       request_params: null,
-      header_tier_id: null,
-      header_tier_name: null,
-      header_tier_color: null,
+      header_tier_id: routing?.headerTierId ?? null,
+      header_tier_name: routing?.headerTierName ?? null,
+      header_tier_color: routing?.headerTierColor ?? null,
     });
     // An M302 patched retry is real provider work even when Manifest ultimately
     // returns its friendly stub; finish that pending Attempt from the audit.
@@ -914,6 +1071,9 @@ export class ProxyMessageRecorder implements OnModuleDestroy {
           header_tier_id: headerTierId ?? null,
           header_tier_name: headerTierName ?? null,
           header_tier_color: headerTierColor ?? null,
+          // Autofix audit for a fallback hop Phoenix was consulted on, so a
+          // recovered hop keeps its issue/patch/operations like a healed primary.
+          ...autofixColumns(f.autofix, f.autofixRole ?? 'original'),
         }),
       );
     }
@@ -1054,29 +1214,33 @@ export class ProxyMessageRecorder implements OnModuleDestroy {
       headerTierName,
       headerTierColor,
       autofix,
+      fallbackAutofix,
       apiMode,
     } = opts ?? {};
 
     const inputTokens = usage?.prompt_tokens ?? 0;
     const outputTokens = usage?.completion_tokens ?? 0;
 
-    const costUsd = computeTokenCost({
-      inputTokens,
-      outputTokens,
-      cacheReadTokens: usage?.cache_read_tokens ?? 0,
-      cacheCreationTokens: usage?.cache_creation_tokens ?? 0,
-      model,
-      pricing: usage ? this.pricingCache.getByModel(model) : undefined,
-      isSubscription: authType === 'subscription',
-      perRequestCostUsd: await this.perRequestSubscriptionCost(provider, authType, model),
-      reportedCostUsd: usage?.reported_cost_usd,
-    });
-
     const canonical = await this.customProviders.canonicalizeAgentMessageKeys(
       ctx.tenantId,
       provider,
       model,
     );
+
+    const costUsd = await this.computeCost(
+      ctx,
+      model,
+      provider,
+      authType,
+      usage,
+      tenantProviderId,
+      canonical.provider,
+      // Bill the hour the provider attempt actually ran: `timestamp` is the
+      // synthetic ordering stamp from recordFallbackFailures, not the attempt
+      // start, so it can cross a peak boundary on delayed writes.
+      attempt ? new Date(attempt.startedAt) : timestamp ? new Date(timestamp) : undefined,
+    );
+
     const canonicalFallbackFrom = await this.customProviders.canonicalizeAgentMessageKeys(
       ctx.tenantId,
       null,
@@ -1110,8 +1274,16 @@ export class ProxyMessageRecorder implements OnModuleDestroy {
       header_tier_id: headerTierId ?? null,
       header_tier_name: headerTierName ?? null,
       header_tier_color: headerTierColor ?? null,
+      // A healed fallback's winning attempt is the Autofix retry: stamp the
+      // group, role, operations, and Phoenix decision so it links to the
+      // original hop recorded in recordFailedFallbacks. Only the fallback's own
+      // record qualifies — an ordinary fallback success must not inherit the
+      // primary's Autofix retry metadata.
+      ...autofixColumns(fallbackAutofix, 'retry'),
     });
-    await this.persistRequest(ctx, requestId, row, true, autofix, apiMode);
+    // The request-level Autofix status prefers the fallback's own outcome when
+    // it healed, falling back to the primary's record otherwise.
+    await this.persistRequest(ctx, requestId, row, true, fallbackAutofix ?? autofix, apiMode);
     await this.persistAttempt(row, attempt);
     this.eventBus.emit(ctx.tenantId, 'message', ctx.userId);
   }
@@ -1147,18 +1319,6 @@ export class ProxyMessageRecorder implements OnModuleDestroy {
     } = opts ?? {};
     const requestId = providedRequestId ?? uuid();
 
-    const costUsd = computeTokenCost({
-      inputTokens: usage.prompt_tokens,
-      outputTokens: usage.completion_tokens,
-      cacheReadTokens: usage.cache_read_tokens ?? 0,
-      cacheCreationTokens: usage.cache_creation_tokens ?? 0,
-      model,
-      pricing: this.pricingCache.getByModel(model),
-      isSubscription: authType === 'subscription',
-      perRequestCostUsd: await this.perRequestSubscriptionCost(provider, authType, model),
-      reportedCostUsd: usage.reported_cost_usd,
-    });
-
     // `model` is a required string, so the overload on
     // `canonicalizeAgentMessageKeys` keeps `canonical.model` non-null.
     const canonical = await this.customProviders.canonicalizeAgentMessageKeys(
@@ -1166,6 +1326,22 @@ export class ProxyMessageRecorder implements OnModuleDestroy {
       provider,
       model,
     );
+
+    const costUsd = await this.computeCost(
+      ctx,
+      model,
+      provider,
+      authType,
+      usage,
+      tenantProviderId,
+      canonical.provider,
+      // Bill a peak/off-peak model on when the attempt started, not on when
+      // this row is written: a long stream that opens at 09:59 and records at
+      // 10:01 is a peak request, and the fallback path already reads it this
+      // way. Falls back to now when the caller tracked no attempt.
+      attempt ? new Date(attempt.startedAt) : undefined,
+    );
+
     const canonicalModel = canonical.model;
     const canonicalProvider = canonical.provider;
 

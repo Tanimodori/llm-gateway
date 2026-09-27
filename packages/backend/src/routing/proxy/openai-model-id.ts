@@ -1,26 +1,19 @@
 import { inferProviderFromModel, type ModelRoute } from 'manifest-shared';
 import type { DiscoveredModel } from '../../model-discovery/model-fetcher';
 import { unambiguousRoute } from '../routing-core/route-helpers';
+import { openAiModelId } from '../routing-core/public-model-id';
 
-export const OPENAI_MODEL_ID_AUTO = 'auto';
-export const SUBSCRIPTION_MODEL_SUFFIX = '-subscription';
+export {
+  OPENAI_MODEL_ID_AUTO,
+  SUBSCRIPTION_MODEL_SUFFIX,
+  openAiModelId,
+  subscriptionOpenAiModelId,
+} from '../routing-core/public-model-id';
 
 export interface ExplicitModelRouteCandidate {
   provider: string;
   model: string;
   providerQualified: boolean;
-}
-
-export function openAiModelId(model: DiscoveredModel): string {
-  const provider = model.provider.toLowerCase();
-  if (provider.startsWith('custom:')) return model.id;
-
-  const prefix = `${provider}/`;
-  const routeId = model.id.toLowerCase().startsWith(prefix) ? model.id : `${provider}/${model.id}`;
-  if (model.authType !== 'subscription' || routeId.endsWith(SUBSCRIPTION_MODEL_SUFFIX)) {
-    return routeId;
-  }
-  return `${routeId}${SUBSCRIPTION_MODEL_SUFFIX}`;
 }
 
 /**

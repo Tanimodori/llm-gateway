@@ -1,5 +1,6 @@
 import { Injectable, OnModuleDestroy, HttpStatus } from '@nestjs/common';
 import { ManifestError } from '../../common/errors/manifest-error';
+import { optionalPositiveInteger } from '../../config/env.util';
 
 const RATE_WINDOW_MS = 60_000;
 const DEFAULT_RATE_MAX_REQUESTS = 200;
@@ -28,6 +29,8 @@ export class ProxyRateLimiter implements OnModuleDestroy {
   private readonly rates = new Map<string, RateEntry>();
   private readonly ipRates = new Map<string, RateEntry>();
   private readonly concurrency = new Map<string, number>();
+  private readonly concurrencyMax =
+    optionalPositiveInteger(process.env.MANIFEST_CONCURRENCY_MAX) ?? DEFAULT_CONCURRENCY_MAX;
   private readonly cleanupTimer: ReturnType<typeof setInterval>;
   private readonly rateMaxRequests: number;
   private readonly ipRateMaxRequests: number;

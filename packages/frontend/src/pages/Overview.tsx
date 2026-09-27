@@ -24,7 +24,7 @@ import { type MessageRow } from '../components/message-table-types.js';
 import { agentDisplayName } from '../services/agent-display-name.js';
 import { agentPlatform, agentCategory } from '../services/agent-platform-store.js';
 import { PROVIDERS } from '../services/providers.js';
-import { getOverview } from '../services/api.js';
+import { getOverview, getOverviewDetails } from '../services/api.js';
 import {
   getAutofixTimeseries,
   getPerModelReliability,
@@ -74,7 +74,7 @@ interface OverviewData {
     attempt_success_rate: number;
     manifest_lift_pct: number;
     recovered: number;
-  };
+  } | null;
   token_usage: Array<{
     hour?: string;
     date?: string;
@@ -103,6 +103,11 @@ interface OverviewData {
   has_data?: boolean;
   has_providers?: boolean;
 }
+
+type OverviewDetails = Pick<
+  OverviewData,
+  'cost_by_model' | 'recent_activity' | 'request_reliability' | 'active_skills'
+>;
 
 type PivotedTimeseries = {
   agents: string[];
@@ -164,20 +169,42 @@ const Overview: Component = () => {
 
   // Never waits on billing/status: the plan-hint lock resolves the range
   // synchronously, so this fetches exactly once at the right range.
-  const [data, { refetch }] = createResource(
-    () => ({ range: effectiveRange(), agentName: params.agentName, _ping: analyticsPing() }),
-    (p) => getOverview(p.range, p.agentName) as Promise<OverviewData>,
+  // The memo's identity changes on every range/agent transition (including
+  // A → B → A) but stays stable across same-scope SSE refreshes.
+  const overviewScope = createMemo(() => ({
+    range: effectiveRange(),
+    agentName: params.agentName,
+  }));
+  const [overviewResult, { refetch }] = createResource(
+    () => ({ scope: overviewScope(), _ping: analyticsPing() }),
+    async (p) => ({
+      scope: p.scope,
+      data: (await getOverview(p.scope.range, p.scope.agentName, true)) as OverviewData,
+    }),
   );
+  const data = () => overviewResult()?.data;
+  const [overviewDetailsResult] = createResource(
+    () => {
+      const result = overviewResult();
+      if (!result || result.scope !== overviewScope()) return false;
+      return result.scope;
+    },
+    async (scope) => ({
+      scope,
+      data: (await getOverviewDetails(scope.range, scope.agentName)) as OverviewDetails,
+    }),
+  );
+  const overviewDetails = () => {
+    const result = overviewDetailsResult();
+    return result?.scope === overviewScope() ? result.data : undefined;
+  };
 
   // The resource re-fetches on range, agent, and every SSE `_ping`. We only want
-  // the loading skeleton on a range change — not on the frequent background ping
-  // refetches (which should update in place). Track the range the visible data
-  // belongs to; while a newer range is loading, treat it as a range change.
-  const [loadedRange, setLoadedRange] = createSignal(effectiveRange());
-  createEffect(() => {
-    if (!data.loading && data() !== undefined) setLoadedRange(effectiveRange());
-  });
-  const rangeChanging = () => data.loading && loadedRange() !== effectiveRange();
+  // the loading skeleton on a range change or agent switch — not on the frequent
+  // background ping refetches (which should update in place). Track the range
+  // and agent the visible data belongs to; while a newer range/agent is loading,
+  // treat it as a change that should show the skeleton instead of stale data.
+  const [loadedScope, setLoadedScope] = createSignal(overviewScope());
 
   const showDashboard = () => {
     const d = data();
@@ -260,14 +287,18 @@ const Overview: Component = () => {
   );
 
   // ── Autofix resources ─────────────────────────────────
-  const [autofixStats] = createResource(
-    () => ({
-      range: effectiveRange(),
-      agent: decodeURIComponent(params.agentName),
-      _ping: analyticsPing(),
-    }),
-    (p) => getAutofixStats(p.range, p.agent),
+  const autofixScope = createMemo(() => ({
+    range: effectiveRange(),
+    agent: decodeURIComponent(params.agentName),
+  }));
+  const [autofixStatsResult] = createResource(
+    () => ({ scope: autofixScope(), _ping: analyticsPing() }),
+    async (p) => ({ scope: p.scope, data: await getAutofixStats(p.scope.range, p.scope.agent) }),
   );
+  const currentAutofixStats = () => {
+    const result = autofixStatsResult();
+    return result?.scope === autofixScope() ? result.data : undefined;
+  };
   // Disposition timeseries: the Requests chart's ONLY view on this page (an
   // agent is the harness, and a request may touch several providers, so no
   // other grouping is meaningful) + the Healed requests tab subset.
@@ -287,6 +318,19 @@ const Overview: Component = () => {
     }),
     (p) => getPerModelReliability(p.range, p.agent),
   );
+
+  createEffect(() => {
+    if (overviewResult.loading) return;
+    if (overviewResult.error === undefined) {
+      const result = overviewResult();
+      if (result === undefined || result.scope !== overviewScope()) return;
+      setLoadedScope(result.scope);
+      return;
+    }
+    setLoadedScope(overviewScope());
+  });
+  const scopeChanging = () => loadedScope() !== overviewScope();
+
   const selfHealedTs = () => {
     const ts = statusTimeseries();
     if (!ts) return undefined;
@@ -396,10 +440,13 @@ const Overview: Component = () => {
       </div>
 
       <Show
-        when={(data() !== undefined || !data.loading) && !rangeChanging()}
+        when={(data() !== undefined || !overviewResult.loading) && !scopeChanging()}
         fallback={<OverviewSkeleton />}
       >
-        <Show when={!data.error} fallback={<ErrorState error={data.error} onRetry={refetch} />}>
+        <Show
+          when={!overviewResult.error}
+          fallback={<ErrorState error={overviewResult.error} onRetry={refetch} />}
+        >
           <Show when={showEmptyState()}>
             <Show
               when={setupCompleted()}
@@ -464,7 +511,7 @@ const Overview: Component = () => {
                     </div>
                   </Show>
                   <AutofixKpiCards
-                    stats={autofixStats()}
+                    stats={currentAutofixStats()}
                     agentName={decodeURIComponent(params.agentName)}
                     range={effectiveRange()}
                   />
@@ -476,11 +523,11 @@ const Overview: Component = () => {
                         requestsValue={d().summary?.messages?.value ?? 0}
                         requestsTrendPct={d().summary?.messages?.trend_pct ?? 0}
                         selfHealedValue={
-                          (autofixStats()?.autofix_saves.value ?? 0) +
-                          (autofixStats()?.fallback_saves?.value ?? 0)
+                          (currentAutofixStats()?.autofix_saves.value ?? 0) +
+                          (currentAutofixStats()?.fallback_saves?.value ?? 0)
                         }
                         selfHealedTrendPct={(() => {
-                          const s = autofixStats();
+                          const s = currentAutofixStats();
                           if (!s) return 0;
                           const cur = s.autofix_saves.value + (s.fallback_saves?.value ?? 0);
                           const prev = s.autofix_saves.previous + (s.fallback_saves?.previous ?? 0);
@@ -534,7 +581,11 @@ const Overview: Component = () => {
                       </A>
                     </div>
                     <MessageTable
-                      items={d().recent_activity?.slice(0, 5) ?? []}
+                      items={
+                        overviewDetails()?.recent_activity?.slice(0, 5) ??
+                        d().recent_activity?.slice(0, 5) ??
+                        []
+                      }
                       columns={columns()}
                       agentName={params.agentName}
                       customProviderName={() => undefined}
@@ -551,7 +602,7 @@ const Overview: Component = () => {
                   </div>
 
                   <CostByModelTable
-                    rows={d().cost_by_model ?? []}
+                    rows={overviewDetails()?.cost_by_model ?? d().cost_by_model ?? []}
                     reliability={modelReliability()}
                     doctorAvailable
                   />
