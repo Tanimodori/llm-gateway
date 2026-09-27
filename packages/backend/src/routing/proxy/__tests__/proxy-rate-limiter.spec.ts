@@ -138,6 +138,24 @@ describe('ProxyRateLimiter', () => {
       expect(rates.has('old-user-0')).toBe(false);
       expect(rates.has('new-user')).toBe(true);
     });
+
+    it('evicts the oldest IP entry when the IP map exceeds 50K entries', () => {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const ipRates = (limiter as any).ipRates as Map<
+        string,
+        { count: number; windowStart: number }
+      >;
+
+      for (let i = 0; i < 50_000; i++) {
+        ipRates.set(`old-ip-${i}`, { count: 1, windowStart: Date.now() });
+      }
+
+      limiter.checkIpLimit('10.0.0.1');
+
+      expect(ipRates.size).toBe(50_000);
+      expect(ipRates.has('old-ip-0')).toBe(false);
+      expect(ipRates.has('10.0.0.1')).toBe(true);
+    });
   });
 
   describe('evictExpired', () => {
@@ -442,8 +460,8 @@ describe('ProxyRateLimiter', () => {
       }
     };
 
-    it('honors RATE_MAX_REQUESTS', () => {
-      withEnv({ RATE_MAX_REQUESTS: '3' }, (l) => {
+    it('honors MANIFEST_RATE_MAX_REQUESTS', () => {
+      withEnv({ MANIFEST_RATE_MAX_REQUESTS: '3' }, (l) => {
         l.checkLimit('user-env');
         l.checkLimit('user-env');
         l.checkLimit('user-env');
@@ -451,26 +469,21 @@ describe('ProxyRateLimiter', () => {
       });
     });
 
-    it('honors IP_RATE_MAX_REQUESTS', () => {
-      withEnv({ IP_RATE_MAX_REQUESTS: '2' }, (l) => {
+    it('honors MANIFEST_IP_RATE_MAX_REQUESTS', () => {
+      withEnv({ MANIFEST_IP_RATE_MAX_REQUESTS: '2' }, (l) => {
         l.checkIpLimit('10.0.0.9');
         l.checkIpLimit('10.0.0.9');
         expect(() => l.checkIpLimit('10.0.0.9')).toThrow(HttpException);
       });
     });
 
-    it('honors CONCURRENCY_MAX', () => {
-      withEnv({ CONCURRENCY_MAX: '1' }, (l) => {
-        l.acquireSlot('tenant-env');
-        expect(() => l.acquireSlot('tenant-env')).toThrow(HttpException);
-      });
-    });
-
-    it('keeps the default when the override is not a positive integer', () => {
-      for (const bad of ['0', '-5', 'abc', '2.5', '']) {
-        withEnv({ CONCURRENCY_MAX: bad }, (l) => {
-          for (let i = 0; i < 10; i++) l.acquireSlot('tenant-bad');
-          expect(() => l.acquireSlot('tenant-bad')).toThrow(HttpException);
+    it('keeps the default when the override is not a plain positive integer', () => {
+      for (const bad of ['0', '-5', 'abc', '2.5', '', '1e3', '0x10']) {
+        withEnv({ MANIFEST_RATE_MAX_REQUESTS: bad, MANIFEST_IP_RATE_MAX_REQUESTS: bad }, (l) => {
+          for (let i = 0; i < 200; i++) l.checkLimit('tenant-bad');
+          expect(() => l.checkLimit('tenant-bad')).toThrow(HttpException);
+          for (let i = 0; i < 500; i++) l.checkIpLimit('10.0.0.10');
+          expect(() => l.checkIpLimit('10.0.0.10')).toThrow(HttpException);
         });
       }
     });
