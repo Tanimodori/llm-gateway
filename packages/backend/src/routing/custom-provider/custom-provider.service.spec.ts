@@ -963,12 +963,35 @@ describe('CustomProviderService', () => {
     });
   });
 
+  it('retags before writing a new key when a rename crosses the local boundary', async () => {
+    const existing = { id: 'cp1', name: 'LM Studio' } as CustomProvider;
+    const { svc, retagAuthType, upsertProvider, getProviders } = makeDeps({
+      findOneResults: [existing, null],
+    });
+    getProviders.mockResolvedValueOnce([connection({ id: 'a', label: 'Main' })]);
+    await svc.update('cp1', 'tenant-1', { name: 'Home Server', apiKey: 'sk-new' });
+    expect(retagAuthType).toHaveBeenCalledWith(null, 'tenant-1', 'custom:cp1', 'api_key');
+    expect(retagAuthType.mock.invocationCallOrder[0]).toBeLessThan(
+      upsertProvider.mock.invocationCallOrder[0],
+    );
+    expect(upsertProvider).toHaveBeenCalledWith(
+      null,
+      'tenant-1',
+      'custom:cp1',
+      'sk-new',
+      'api_key',
+      undefined,
+      'Main',
+      undefined,
+    );
+  });
+
   describe('primaryCustomConnection', () => {
     it('picks the active connection with the lowest priority for that provider', () => {
       const rows = [
         connection({ id: 'other', provider: 'custom:other', priority: -1 }),
         connection({ id: 'b', label: 'B', priority: 1 }),
-        connection({ id: 'off', label: 'Off', priority: 0, is_active: false }),
+        connection({ id: 'off', label: 'Off', priority: -1, is_active: false }),
         connection({ id: 'a', label: 'A', priority: 0 }),
       ];
       expect(primaryCustomConnection(rows, 'custom:cp1')?.id).toBe('a');

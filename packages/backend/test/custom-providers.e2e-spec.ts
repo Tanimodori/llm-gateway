@@ -455,16 +455,16 @@ describe('Custom Providers (e2e)', () => {
       await request(server())
         .put(`/api/v1/routing/${agentName}/custom-providers/${id}`)
         .set(headers)
-        .send({ apiKey: 'sk-rotated-a' })
+        .send({ apiKey: 'sk-rot1-account-a' })
         .expect(200);
       await request(server())
         .post(`/api/v1/routing/${agentName}/providers`)
         .set(headers)
-        .send({ provider: key, apiKey: 'sk-rotated-again' })
+        .send({ provider: key, apiKey: 'sk-rot2-account-a' })
         .expect(201);
 
       expect(await connectionsOf()).toEqual([
-        ['Account A', 'sk-rotat'],
+        ['Account A', 'sk-rot2-'],
         ['Account B', 'sk-accou'],
       ]);
     });
@@ -488,7 +488,7 @@ describe('Custom Providers (e2e)', () => {
         .set(headers)
         .expect(200);
 
-      expect(await connectionsOf()).toEqual([['Account A', 'sk-rotat']]);
+      expect(await connectionsOf()).toEqual([['Account A', 'sk-rot2-']]);
     });
 
     it('deleting the custom provider removes every connection', async () => {

@@ -450,14 +450,23 @@ export class CustomProviderService {
     const nameCategoryChanged =
       previousName !== cp.name && authTypeForCustomProvider(previousName) !== nextAuthType;
 
-    // Update API key if explicitly provided. Preserve the auth_type
-    // derived from the (possibly renamed) display name so toggling between
-    // "LM Studio" ↔ a freeform name re-tags the companion tenant_providers
-    // row accordingly.
+    // Flip auth_type in place first, so the rows keep their stored keys and
+    // tier overrides. Going through upsertProvider alone would insert a second
+    // row, since the unique index is keyed on (tenant_id, provider, auth_type).
+    if (nameCategoryChanged) {
+      await this.providerService.retagAuthType(
+        null,
+        tenantId,
+        CustomProviderService.providerKey(id),
+        nextAuthType,
+      );
+    }
+
+    // Update API key if explicitly provided, under the auth_type derived from
+    // the (possibly renamed) display name. Pin the write to the primary
+    // connection: the unlabeled path matches a row named 'Default' and would
+    // add a second connection once the primary one has been renamed.
     if ('apiKey' in dto) {
-      // Pin the write to the primary connection: the unlabeled path matches a
-      // row named 'Default' and would add a second connection once the
-      // primary one has been renamed.
       const primary = await this.primaryConnection(tenantId, id);
       await this.providerService.upsertProvider(
         null,
@@ -468,17 +477,6 @@ export class CustomProviderService {
         undefined,
         primary?.label,
         actorUserId,
-      );
-    } else if (nameCategoryChanged) {
-      // Rename-only path: flip auth_type in place so the row keeps its
-      // stored api_key_encrypted and tier overrides stay intact. Going
-      // through upsertProvider would insert a second row since the unique
-      // index is keyed on (tenant_id, provider, auth_type).
-      await this.providerService.retagAuthType(
-        null,
-        tenantId,
-        CustomProviderService.providerKey(id),
-        nextAuthType,
       );
     }
 

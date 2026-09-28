@@ -9,6 +9,7 @@ import {
   type CustomProviderApiKind,
   type CustomProviderModel,
   type CustomProviderData,
+  type RoutingProvider,
 } from '../services/api.js';
 import { toast } from '../services/toast-store.js';
 import { checkIsSelfHosted } from '../services/setup-status.js';
@@ -106,7 +107,15 @@ const CustomProviderForm: Component<Props> = (props) => {
   // providers (LM Studio, Ollama names) keep the single optional key field.
   const [connections, { refetch: refetchConnections }] = createResource(
     () => (props.initialData ? props.agentName : null),
-    (agentName) => getProviders(agentName),
+    // A failed refresh after a key change keeps the list already on screen.
+    async (agentName: string, { value }: { value?: RoutingProvider[] }) => {
+      try {
+        return await getProviders(agentName);
+      } catch (err) {
+        if (value) return value;
+        throw err;
+      }
+    },
   );
   // Reading a failed resource throws, so every read goes through this guard.
   const loadedConnections = () => (connections.error ? undefined : connections.latest);

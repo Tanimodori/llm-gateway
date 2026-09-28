@@ -1912,12 +1912,21 @@ describe("CustomProviderForm — edit mode: key connections", () => {
 
     fireEvent.click(screen.getByText("Save changes"));
 
-    await waitFor(() => {
-      expect(mockUpdateCustomProvider).toHaveBeenCalledWith(
-        "test-agent",
-        "cp-1",
-        expect.not.objectContaining({ apiKey: expect.anything() }),
-      );
-    });
+    await waitFor(() => expect(mockUpdateCustomProvider).toHaveBeenCalledTimes(1));
+    expect(mockUpdateCustomProvider.mock.calls[0][2]).not.toHaveProperty("apiKey");
+  });
+
+  it("keeps the key list when a refresh after a key change fails", async () => {
+    mockGetProviders.mockResolvedValueOnce([
+      connection({ id: "tp-2", label: "Account B", priority: 1 }),
+      connection({ label: "Account A" }),
+    ]);
+    renderForm();
+    fireEvent.click(await screen.findByLabelText("Delete key Account B"));
+    mockGetProviders.mockRejectedValueOnce(new Error("network"));
+
+    await waitFor(() => expect(mockGetProviders).toHaveBeenCalledTimes(2));
+    expect(screen.getByRole("list", { name: "API keys for Pooled" })).toBeDefined();
+    expect(screen.queryByText(KEYS_HINT)).not.toBeNull();
   });
 });
