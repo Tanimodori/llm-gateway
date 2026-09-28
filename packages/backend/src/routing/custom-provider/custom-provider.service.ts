@@ -24,6 +24,7 @@ import {
   CustomProviderApiKind,
   CustomProviderModel,
 } from '../../entities/custom-provider.entity';
+import type { TenantProvider } from '../../entities/tenant-provider.entity';
 import { ProviderService } from '../routing-core/provider.service';
 import { RoutingCacheService } from '../routing-core/routing-cache.service';
 import { CreateCustomProviderDto, UpdateCustomProviderDto } from '../dto/custom-provider.dto';
@@ -50,6 +51,25 @@ const EMBEDDING_MODEL_PATTERN =
 
 export function isEmbeddingModel(id: string): boolean {
   return EMBEDDING_MODEL_PATTERN.test(id);
+}
+
+/**
+ * The connection that stands for a custom provider when a caller names none:
+ * the first active row by priority, which is the key the proxy forwards an
+ * unpinned route with. Inactive rows only count when nothing is active.
+ */
+export function primaryCustomConnection(
+  rows: readonly TenantProvider[],
+  providerKey: string,
+): TenantProvider | undefined {
+  return rows
+    .filter((r) => r.provider === providerKey)
+    .sort(
+      (a, b) =>
+        Number(b.is_active) - Number(a.is_active) ||
+        a.priority - b.priority ||
+        a.id.localeCompare(b.id),
+    )[0];
 }
 
 /**
@@ -151,6 +171,14 @@ export class CustomProviderService {
   /** Provider key used in TenantProvider tables. */
   static providerKey(id: string): string {
     return `custom:${id}`;
+  }
+
+  /** The primary connection of one custom provider (see primaryCustomConnection). */
+  async primaryConnection(tenantId: string, id: string): Promise<TenantProvider | undefined> {
+    return primaryCustomConnection(
+      await this.providerService.getProviders(tenantId),
+      CustomProviderService.providerKey(id),
+    );
   }
 
   /** Unique model name for model lookups. */
@@ -427,6 +455,10 @@ export class CustomProviderService {
     // "LM Studio" ↔ a freeform name re-tags the companion tenant_providers
     // row accordingly.
     if ('apiKey' in dto) {
+      // Pin the write to the primary connection: the unlabeled path matches a
+      // row named 'Default' and would add a second connection once the
+      // primary one has been renamed.
+      const primary = await this.primaryConnection(tenantId, id);
       await this.providerService.upsertProvider(
         null,
         tenantId,
@@ -434,7 +466,7 @@ export class CustomProviderService {
         dto.apiKey,
         nextAuthType,
         undefined,
-        undefined,
+        primary?.label,
         actorUserId,
       );
     } else if (nameCategoryChanged) {
@@ -600,9 +632,7 @@ export class CustomProviderService {
     if (trimBaseUrl(cp.base_url) !== trimBaseUrl(baseUrl) || cp.api_kind !== apiKind) {
       return undefined;
     }
-    const provKey = CustomProviderService.providerKey(providerId);
-    const tenantProviders = await this.providerService.getProviders(tenantId);
-    const row = tenantProviders.find((p) => p.provider === provKey);
+    const row = await this.primaryConnection(tenantId, providerId);
     if (!row?.api_key_encrypted) return undefined;
     try {
       return decryptWithAny(row.api_key_encrypted, getDecryptionSecrets()).plaintext;
