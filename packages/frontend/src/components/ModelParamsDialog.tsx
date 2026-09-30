@@ -70,6 +70,20 @@ const stateFromCurrent = (
   return draft;
 };
 
+// Paths the harness actually stores. Only these (and whatever the user edits)
+// are saved: a value equal to the provider default is still an explicit choice.
+const setPathsFromCurrent = (
+  specs: readonly ProviderParamSpec[],
+  current: RequestParamDefaults | null,
+): Set<string> =>
+  new Set(
+    current
+      ? specs
+          .filter((spec) => getProviderParamValue(current, spec.path) !== undefined)
+          .map((spec) => spec.path)
+      : [],
+  );
+
 const groupSpecs = (specs: readonly ProviderParamSpec[]) =>
   GROUP_ORDER.map((group) => ({
     group,
@@ -100,11 +114,17 @@ const numberDefault = (spec: ProviderParamSpec): number =>
 
 const ModelParamsDialog: Component<Props> = (props) => {
   const [draft, setDraft] = createSignal<DraftState>(stateFromCurrent(props.specs, props.current));
+  const [setPaths, setSetPaths] = createSignal<Set<string>>(
+    setPathsFromCurrent(props.specs, props.current),
+  );
   const [saving, setSaving] = createSignal(false);
   const hasSpecs = () => props.specs.length > 0;
 
   createEffect(() => {
-    if (props.open) setDraft(stateFromCurrent(props.specs, props.current));
+    if (props.open) {
+      setDraft(stateFromCurrent(props.specs, props.current));
+      setSetPaths(setPathsFromCurrent(props.specs, props.current));
+    }
   });
 
   const valueFor = (spec: ProviderParamSpec): JsonValue | undefined => {
@@ -115,12 +135,24 @@ const ModelParamsDialog: Component<Props> = (props) => {
     return (value === undefined ? spec.default : value) as JsonValue | undefined;
   };
 
+  const isSet = (spec: ProviderParamSpec): boolean => setPaths().has(spec.path);
+
   const setValue = (spec: ProviderParamSpec, value: JsonValue) => {
     setDraft(setProviderParamValue(draft(), spec.path, value));
+    setSetPaths(new Set([...setPaths(), spec.path]));
   };
 
-  const clearValue = (spec: ProviderParamSpec) => {
-    setDraft(deleteProviderParamValue(draft(), spec.path));
+  // Back to "not set": the client's value passes through. The draft keeps the
+  // provider default so dependent params still evaluate their availability.
+  const unsetValue = (spec: ProviderParamSpec) => {
+    setDraft(
+      spec.default === undefined
+        ? deleteProviderParamValue(draft(), spec.path)
+        : setProviderParamValue(draft(), spec.path, spec.default),
+    );
+    const next = new Set(setPaths());
+    next.delete(spec.path);
+    setSetPaths(next);
   };
 
   const isApplicable = (spec: ProviderParamSpec): boolean =>
@@ -244,7 +276,7 @@ const ModelParamsDialog: Component<Props> = (props) => {
         disabled={isDisabled(spec)}
         onChange={(v) => {
           if (v === UNSET_OPTION_VALUE && canUnset(spec)) {
-            clearValue(spec);
+            unsetValue(spec);
             return;
           }
           setValue(spec, v);
@@ -351,9 +383,13 @@ const ModelParamsDialog: Component<Props> = (props) => {
   };
 
   const NumberRow = (spec: ProviderParamSpec) => {
-    const value = () => numericValue(spec);
+    const value = () => (isSet(spec) ? numericValue(spec) : '');
     const setFromInput = (raw: string) => {
       if (isDisabled(spec)) return;
+      if (raw.trim() === '') {
+        unsetValue(spec);
+        return;
+      }
       const parsed = Number.parseFloat(raw);
       const clamped = clampNumber(parsed, numberDefault(spec), spec.range?.min, spec.range?.max);
       setValue(spec, spec.type === 'integer' ? Math.trunc(clamped) : clamped);
@@ -365,6 +401,7 @@ const ModelParamsDialog: Component<Props> = (props) => {
         min={spec.range?.min}
         max={spec.range?.max}
         value={value()}
+        placeholder={spec.default === undefined ? 'Not set' : String(spec.default)}
         disabled={isDisabled(spec)}
         aria-label={spec.label}
         onInput={(e) => setFromInput(e.currentTarget.value)}
@@ -396,7 +433,7 @@ const ModelParamsDialog: Component<Props> = (props) => {
         props.specs
           .filter((spec) => spec.path.includes('.'))
           .filter((spec) => isApplicable(spec))
-          .filter((spec) => !valuesEqual(valueFor(spec), spec.default))
+          .filter((spec) => isSet(spec))
           .map((spec) => spec.path.split('.')[0]),
       );
 
@@ -407,7 +444,7 @@ const ModelParamsDialog: Component<Props> = (props) => {
         const root = spec.path.split('.')[0];
         const includeNestedDefault =
           spec.path.includes('.') && nestedRootsWithOverrides.has(root) && value !== undefined;
-        if (includeNestedDefault || !valuesEqual(value, spec.default)) {
+        if (includeNestedDefault || isSet(spec)) {
           out = setProviderParamValue(out, spec.path, value);
         }
       }
@@ -458,7 +495,24 @@ const ModelParamsDialog: Component<Props> = (props) => {
             </Show>
           </div>
           <div class="model-params__label-hint">{description()}</div>
-          <div class="model-params__default-hint">Default: {defaultLabel()}</div>
+          <div class="model-params__default-hint">
+            Default: {defaultLabel()}
+            <Show when={isApplicable(spec())}>
+              {' · '}
+              <Show when={isSet(spec())} fallback="Not set">
+                Set{' · '}
+                <button
+                  type="button"
+                  class="model-params__reset"
+                  disabled={saving()}
+                  aria-label={`Reset ${spec().label}`}
+                  onClick={() => unsetValue(spec())}
+                >
+                  Reset
+                </button>
+              </Show>
+            </Show>
+          </div>
         </div>
         <div class="model-params__row-control">{renderControl(spec())}</div>
       </div>
@@ -491,7 +545,7 @@ const ModelParamsDialog: Component<Props> = (props) => {
               {props.loading
                 ? `Loading parameters for ${props.slotLabel}…`
                 : hasSpecs()
-                  ? `Defaults for ${props.slotLabel}. Client requests override.`
+                  ? `Values you set override the client's request for ${props.slotLabel}; unset ones keep the client's value. Requests that name a model instead of auto skip them.`
                   : `No parameter controls are published for ${props.slotLabel} yet.`}
             </p>
 
