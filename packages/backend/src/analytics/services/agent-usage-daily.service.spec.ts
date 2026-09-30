@@ -78,6 +78,8 @@ describe('AgentUsageDailyService', () => {
   it('stays on the rollup once the backfill is confirmed, even if the worker lags', async () => {
     delete process.env['AGENT_USAGE_DAILY_READS'];
     delete process.env['AGENT_USAGE_DAILY_READ_TENANTS'];
+    // Only the first response should be consumed. The lag and timeout
+    // responses are tripwires that would switch reads off if the check re-ran.
     const query = jest
       .fn()
       .mockResolvedValueOnce([{ ready: true }])
