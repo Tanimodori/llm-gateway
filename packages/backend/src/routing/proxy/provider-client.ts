@@ -17,7 +17,7 @@ import {
   applyAnthropicAutomaticCacheControl,
   applyAnthropicLastMessageCacheControl,
   applyAnthropicMessagesMutations,
-  hasCacheControl,
+  hasMessageCacheControl,
   toGoogleRequest,
   toAnthropicRequest,
   toResponsesRequest,
@@ -161,9 +161,9 @@ function shouldApplyAnthropicAutomaticCacheControl(endpointKey: string): boolean
 /**
  * The last-message breakpoint costs a cache write, so add it only where it
  * pays back: a Claude model (the family that caches only where marked), a
- * caller that has not planned its own cache, and a request that is part of a
- * conversation. A lone message without tools is usually a one-shot call (a
- * title, a summary) whose cache would never be read.
+ * caller that has not placed its own message breakpoints, and a request that
+ * is part of a conversation. A lone message without tools is usually a
+ * one-shot call (a title, a summary) whose cache would never be read.
  */
 function shouldAddConversationCacheBreakpoint(
   model: string,
@@ -172,9 +172,9 @@ function shouldAddConversationCacheBreakpoint(
   requestBody: Record<string, unknown>,
 ): boolean {
   if (!/claude/i.test(model)) return false;
-  // Only native Messages callers reach the upstream with their own
+  // Only native Messages callers reach the upstream with their own message
   // breakpoints; translating Chat Completions drops them.
-  if (apiMode === 'messages' && hasCacheControl(inboundBody)) return false;
+  if (apiMode === 'messages' && hasMessageCacheControl(inboundBody)) return false;
   const { messages, tools } = requestBody;
   const hasTools = Array.isArray(tools) && tools.length > 0;
   return hasTools || (Array.isArray(messages) && messages.length > 1);

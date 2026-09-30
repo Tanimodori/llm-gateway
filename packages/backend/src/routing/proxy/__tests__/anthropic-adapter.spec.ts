@@ -2,6 +2,7 @@ import {
   applyAnthropicAutomaticCacheControl,
   applyAnthropicLastMessageCacheControl,
   applyAnthropicMessagesMutations,
+  hasMessageCacheControl,
   closeAnthropicObjectSchemas,
   extractThinkingBlocksFromMessagesResponse,
   toAnthropicRequest,
@@ -3253,5 +3254,44 @@ describe('applyAnthropicLastMessageCacheControl', () => {
 
     expect(oneHour.messages[0].content).toBe('hi');
     expect(topLevel.messages[0].content).toBe('hi');
+  });
+});
+
+describe('hasMessageCacheControl', () => {
+  const cache = { type: 'ephemeral' };
+
+  it('finds a breakpoint on a message block', () => {
+    expect(
+      hasMessageCacheControl({
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'hi', cache_control: cache }] }],
+      }),
+    ).toBe(true);
+  });
+
+  it.each([
+    ['no messages', {}],
+    ['string content', { messages: [{ role: 'user', content: 'hi' }] }],
+    ['a non-object message', { messages: ['hi'] }],
+    [
+      'a breakpoint on system or tools only',
+      {
+        system: [{ type: 'text', text: 's', cache_control: cache }],
+        tools: [{ name: 't', cache_control: cache }],
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+      },
+    ],
+    [
+      'a tool_use input field named cache_control',
+      {
+        messages: [
+          {
+            role: 'assistant',
+            content: [{ type: 'tool_use', id: 't1', name: 'x', input: { cache_control: 'on' } }],
+          },
+        ],
+      },
+    ],
+  ])('ignores %s', (_label, body) => {
+    expect(hasMessageCacheControl(body as Record<string, unknown>)).toBe(false);
   });
 });

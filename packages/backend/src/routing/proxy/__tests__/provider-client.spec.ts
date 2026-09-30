@@ -1011,6 +1011,42 @@ describe('ProviderClient', () => {
         expect(sent.messages.at(-1).content).toBe('turn 2');
       });
 
+      it('still marks a native Messages caller that only cached its system prompt', async () => {
+        const sent = await sentBodyFor({
+          apiMode: 'messages',
+          body: {
+            ...nativeConversation,
+            system: [{ type: 'text', text: 'Be concise.', cache_control: cache }],
+          },
+        });
+
+        expect(sent.messages.at(-1).content).toEqual([
+          { type: 'text', text: 'turn 2', cache_control: cache },
+        ]);
+      });
+
+      it('does not read a tool schema property named cache_control as a breakpoint', async () => {
+        const sent = await sentBodyFor({
+          apiMode: 'messages',
+          body: {
+            ...nativeConversation,
+            tools: [
+              {
+                name: 'set_cache',
+                input_schema: {
+                  type: 'object',
+                  properties: { cache_control: { type: 'string' } },
+                },
+              },
+            ],
+          },
+        });
+
+        expect(sent.messages.at(-1).content).toEqual([
+          { type: 'text', text: 'turn 2', cache_control: cache },
+        ]);
+      });
+
       it('still marks a Chat Completions caller whose cache_control translation drops', async () => {
         const marked = {
           messages: [

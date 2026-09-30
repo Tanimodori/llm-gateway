@@ -60,8 +60,20 @@ function isObjectRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object' && !Array.isArray(value);
 }
 
-export function hasCacheControl(value: unknown): boolean {
-  return countCacheControlBlocks(value) > 0;
+/**
+ * Whether a native Messages body already places a breakpoint on a message
+ * block, the placement the conversation breakpoint would compete with. Marks
+ * on system or tools alone leave the conversation uncached, and a tool schema
+ * property named `cache_control` is data, not a breakpoint.
+ */
+export function hasMessageCacheControl(body: Record<string, unknown>): boolean {
+  if (!Array.isArray(body.messages)) return false;
+  return body.messages.some(
+    (message) =>
+      isObjectRecord(message) &&
+      Array.isArray(message.content) &&
+      message.content.some((block) => isObjectRecord(block) && block.cache_control !== undefined),
+  );
 }
 
 function countCacheControlBlocks(value: unknown): number {
