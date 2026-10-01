@@ -729,6 +729,42 @@ describe('ModelParamsDialog', () => {
       await waitFor(() => expect(onSave).toHaveBeenCalledWith(null));
     });
 
+    it('leaves the slider text box empty until the user sets a value', async () => {
+      const onSave = vi.fn().mockResolvedValue(undefined);
+      render(() => (
+        <ModelParamsDialog
+          {...baseProps}
+          specs={anthropicSpecs}
+          slotLabel="claude-sonnet-4-6"
+          current={{ temperature: 0.4 }}
+          onSave={onSave}
+        />
+      ));
+      const topP = screen.getByLabelText('Top P value') as HTMLInputElement;
+      expect(topP.value).toBe('');
+      expect(topP.placeholder).toBe('1');
+
+      const temperature = screen.getByLabelText('Temperature value') as HTMLInputElement;
+      expect(temperature.value).toBe('0.4');
+      fireEvent.input(temperature, { target: { value: '' } });
+      fireEvent.blur(temperature);
+      expect(temperature.value).toBe('');
+      fireEvent.click(screen.getByText('Save'));
+      await waitFor(() => expect(onSave).toHaveBeenCalledWith(null));
+    });
+
+    it('labels nested siblings the proxy sends with a set root', () => {
+      render(() => (
+        <ModelParamsDialog
+          {...baseProps}
+          specs={anthropicSpecs}
+          slotLabel="claude-sonnet-4-6"
+          current={{ thinking: { type: 'enabled' } }}
+        />
+      ));
+      expect(screen.getByText(/Default sent with thinking/)).toBeTruthy();
+    });
+
     it('shows "Not set" as placeholder when the spec has no default', () => {
       render(() => (
         <ModelParamsDialog

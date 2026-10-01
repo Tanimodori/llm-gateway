@@ -137,6 +137,22 @@ const ModelParamsDialog: Component<Props> = (props) => {
 
   const isSet = (spec: ProviderParamSpec): boolean => setPaths().has(spec.path);
 
+  const pathRoot = (path: string): string => path.split('.')[0] ?? path;
+
+  // The proxy fills in the default of every applicable sibling under a nested
+  // root that has a value set (e.g. thinking.budget_tokens with thinking.type),
+  // so such a row is sent even though the user never set it.
+  const sentWithRoot = (spec: ProviderParamSpec): boolean =>
+    spec.path.includes('.') &&
+    spec.default !== undefined &&
+    props.specs.some(
+      (other) =>
+        other.path !== spec.path &&
+        pathRoot(other.path) === pathRoot(spec.path) &&
+        isSet(other) &&
+        isApplicable(other),
+    );
+
   const setValue = (spec: ProviderParamSpec, value: JsonValue) => {
     setDraft(setProviderParamValue(draft(), spec.path, value));
     setSetPaths(new Set([...setPaths(), spec.path]));
@@ -311,18 +327,25 @@ const ModelParamsDialog: Component<Props> = (props) => {
       }
     };
 
+    // Unset: the text box stays empty (default as placeholder) while the
+    // thumb rests on the default, since a slider always needs a position.
+    const text = () => (isSet(spec) ? String(value()) : '');
     let numberInputRef: HTMLInputElement | undefined;
     createEffect(() => {
-      const next = value();
+      const next = text();
       if (numberInputRef && document.activeElement !== numberInputRef) {
-        numberInputRef.value = String(next);
+        numberInputRef.value = next;
       }
     });
 
     const commitFromText = (raw: string) => {
       if (isDisabled(spec)) return;
       const normalized = raw.replace(',', '.').trim();
-      if (normalized === '' || normalized === '-' || normalized === '.' || normalized === '-.') {
+      if (normalized === '') {
+        unsetValue(spec);
+        return;
+      }
+      if (normalized === '-' || normalized === '.' || normalized === '-.') {
         return;
       }
       const parsed = Number.parseFloat(normalized);
@@ -338,14 +361,15 @@ const ModelParamsDialog: Component<Props> = (props) => {
         <input
           ref={(el) => {
             numberInputRef = el;
-            if (el) el.value = String(value());
+            if (el) el.value = text();
           }}
           type="text"
           inputmode="decimal"
           class="model-params__number model-params__number--slider"
+          placeholder={String(value())}
           disabled={isDisabled(spec)}
           aria-label={`${spec.label} value`}
-          onBlur={(e) => (e.currentTarget.value = String(value()))}
+          onBlur={(e) => (e.currentTarget.value = text())}
           onInput={(e) => commitFromText(e.currentTarget.value)}
         />
         <div class="model-params__slider-field">
@@ -499,7 +523,12 @@ const ModelParamsDialog: Component<Props> = (props) => {
             Default: {defaultLabel()}
             <Show when={isApplicable(spec())}>
               {' · '}
-              <Show when={isSet(spec())} fallback="Not set">
+              <Show
+                when={isSet(spec())}
+                fallback={
+                  sentWithRoot(spec()) ? `Default sent with ${pathRoot(spec().path)}` : 'Not set'
+                }
+              >
                 Set{' · '}
                 <button
                   type="button"
