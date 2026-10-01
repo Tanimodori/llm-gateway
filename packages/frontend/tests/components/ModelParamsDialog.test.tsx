@@ -736,16 +736,18 @@ describe('ModelParamsDialog', () => {
           {...baseProps}
           specs={anthropicSpecs}
           slotLabel="claude-sonnet-4-6"
-          current={{ temperature: 0.4 }}
           onSave={onSave}
         />
       ));
-      const topP = screen.getByLabelText('Top P value') as HTMLInputElement;
-      expect(topP.value).toBe('');
-      expect(topP.placeholder).toBe('1');
-
       const temperature = screen.getByLabelText('Temperature value') as HTMLInputElement;
+      expect(temperature.disabled).toBe(false);
+      expect(temperature.value).toBe('');
+      expect(temperature.placeholder).toBe('1');
+
+      fireEvent.input(temperature, { target: { value: '0.4' } });
+      fireEvent.blur(temperature);
       expect(temperature.value).toBe('0.4');
+
       fireEvent.input(temperature, { target: { value: '' } });
       fireEvent.blur(temperature);
       expect(temperature.value).toBe('');
