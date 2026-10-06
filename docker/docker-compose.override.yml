@@ -1,0 +1,27 @@
+# Local deployment overlay.
+#
+# Compose auto-merges this over docker-compose.yml (same directory, default
+# file name), so ports, environment, volumes and hardenings all still come
+# from the upstream compose file — only the image source changes: it is
+# built from this checkout instead of pulled from Docker Hub.
+#
+# Fresh build + start:
+#   cd docker && docker compose up -d --build
+#
+# After changing app code, rebuild the dist bundles first (repo root):
+#   npm ci
+#   VITE_MANIFEST_SELFHOSTED=true npx turbo build --filter=manifest-backend --filter=manifest-frontend --filter=manifest-shared
+#   cd docker && docker compose build manifest && docker compose up -d
+services:
+  manifest:
+    image: manifest-local:latest
+    # The upstream compose file ships no restart policy; add one so the
+    # stack comes back automatically after a VM restart, like the other
+    # services in this WSL distro.
+    restart: unless-stopped
+    build:
+      # Repository root: the Dockerfile consumes packages/*/dist from here.
+      context: ..
+      dockerfile: docker/Dockerfile.local
+  postgres:
+    restart: unless-stopped

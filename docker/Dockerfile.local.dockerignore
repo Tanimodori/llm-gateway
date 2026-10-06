@@ -1,0 +1,25 @@
+# Context filter for docker/Dockerfile.local (BuildKit picks this up by the
+# "<dockerfile>.dockerignore" naming convention, which also means the repo's
+# root .dockerignore — which excludes dist/ — does not apply here).
+#
+# Whitelist: the image only needs the runtime package manifests plus the
+# prebuilt packages/*/dist bundles. Everything else in the repo (sources,
+# node_modules, .git, docs, other packages) stays out of the build context.
+*
+!package.json
+!package-lock.json
+!packages
+!packages/shared
+!packages/shared/package.json
+!packages/shared/dist
+!packages/shared/dist/**
+!packages/backend
+!packages/backend/package.json
+!packages/backend/dist
+!packages/backend/dist/**
+!packages/frontend
+!packages/frontend/package.json
+!packages/frontend/dist
+!packages/frontend/dist/**
+!packages/manifest
+!packages/manifest/package.json

@@ -1,0 +1,76 @@
+# Locally built Manifest image.
+#
+# Unlike docker/Dockerfile (the release pipeline's builder), this file does
+# not compile anything: it packages the dist/ bundles already produced in
+# this checkout. Build them on the host first:
+#
+#   npm ci
+#   npx turbo build --filter=manifest-backend --filter=manifest-frontend --filter=manifest-shared
+#   # the frontend needs VITE_MANIFEST_SELFHOSTED=true to show the version badge
+#
+# Then build from the repository root (context must be the root so the
+# packages/*/dist artifacts are visible; docker/Dockerfile.local.dockerignore
+# prunes everything else out of the context):
+#
+#   docker buildx build -f docker/Dockerfile.local -t manifest-local:latest .
+#
+# Or let docker-compose.override.yml do it: `cd docker && docker compose up -d --build`.
+#
+# Runtime dependencies are still installed inside this build (on Linux, so the
+# binaries match the runtime) — never copied from the host's node_modules,
+# which may contain Windows/macOS builds. --ignore-scripts keeps the install
+# pure-JS, so the build stage's libc does not matter to the runtime.
+
+# Stage 1: production dependencies only.
+FROM node:24-slim AS prod-deps
+WORKDIR /app
+RUN mkdir -p /app/request-recordings
+COPY package.json package-lock.json ./
+COPY packages/shared/package.json packages/shared/
+COPY packages/frontend/package.json packages/frontend/
+COPY packages/backend/package.json packages/backend/
+RUN --mount=type=cache,target=/root/.npm \
+    npm ci --omit=dev --omit=optional --ignore-scripts \
+           --prefer-offline --no-audit --no-fund --loglevel=error && \
+    mkdir -p packages/backend/node_modules && \
+    rm -rf node_modules/typescript node_modules/@types \
+           node_modules/ts-node node_modules/acorn \
+           node_modules/create-require node_modules/v8-compile-cache-lib && \
+    find . -path "*/node_modules/@esbuild" -type d -exec rm -rf {} + 2>/dev/null; \
+    find . -path "*/node_modules/@vitest" -type d -exec rm -rf {} + 2>/dev/null; \
+    true
+
+# Stage 2: distroless runtime. Nonroot (UID 65532), no shell, no package manager.
+FROM gcr.io/distroless/nodejs24-debian13:nonroot AS runtime
+WORKDIR /app
+
+ENV NODE_ENV=production
+ENV BIND_ADDRESS=0.0.0.0
+# Distroless keeps the node binary off PATH; compose healthchecks call `node`.
+ENV PATH=/nodejs/bin:$PATH
+
+COPY --from=prod-deps --chown=nonroot:nonroot /app/node_modules node_modules
+COPY --from=prod-deps --chown=nonroot:nonroot /app/packages/backend/node_modules packages/backend/node_modules
+COPY --from=prod-deps --chown=nonroot:nonroot /app/request-recordings /data/request-recordings
+COPY --from=prod-deps --chown=nonroot:nonroot /app/package.json package.json
+
+# Prebuilt artifacts from this checkout (the point of this Dockerfile).
+COPY --chown=nonroot:nonroot packages/shared/dist packages/shared/dist
+COPY --chown=nonroot:nonroot packages/backend/dist packages/backend/dist
+COPY --chown=nonroot:nonroot packages/frontend/dist packages/frontend/dist
+# Workspace manifests: the backend resolves `manifest-shared` through the
+# workspace symlink, and the telemetry sender reads the release version from
+# packages/manifest/package.json at boot.
+COPY --chown=nonroot:nonroot packages/shared/package.json packages/shared/
+COPY --chown=nonroot:nonroot packages/backend/package.json packages/backend/
+COPY --chown=nonroot:nonroot packages/manifest/package.json packages/manifest/
+
+EXPOSE 2099
+
+# Distroless has no shell, so the probe is exec-form node. PORT is read at
+# runtime; 2099 is the default the compose stack uses.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=45s --retries=3 \
+  CMD ["node", "-e", "const p=process.env.PORT||'2099';fetch(`http://127.0.0.1:${p}/api/v1/health`).then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+
+# The distroless entrypoint is already ["/nodejs/bin/node"].
+CMD ["packages/backend/dist/main.js"]
